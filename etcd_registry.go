@@ -19,6 +19,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"net"
 	"os"
 	"strconv"
@@ -35,11 +36,14 @@ const (
 	defaultTTL          = 60
 	kitexIpToRegistry   = "KITEX_IP_TO_REGISTRY"
 	kitexPortToRegistry = "KITEX_PORT_TO_REGISTRY"
+	maxRetryKey         = "KITEX_ETCD_REGISTRY_MAX_RETRY"
+	defaultMaxRetry     = 5
 )
 
 type etcdRegistry struct {
 	etcdClient *clientv3.Client
 	leaseTTL   int64
+	maxRetry   int
 	meta       *registerMeta
 }
 
@@ -64,6 +68,7 @@ func NewEtcdRegistry(endpoints []string, opts ...Option) (registry.Registry, err
 	return &etcdRegistry{
 		etcdClient: etcdClient,
 		leaseTTL:   getTTL(),
+		maxRetry:   getMaxRetry(),
 	}, nil
 }
 
@@ -81,6 +86,7 @@ func NewEtcdRegistryWithAuth(endpoints []string, username, password string) (reg
 	return &etcdRegistry{
 		etcdClient: etcdClient,
 		leaseTTL:   getTTL(),
+		maxRetry:   getMaxRetry(),
 	}, nil
 }
 
@@ -89,22 +95,19 @@ func (e *etcdRegistry) Register(info *registry.Info) error {
 	if err := validateRegistryInfo(info); err != nil {
 		return err
 	}
-	leaseID, err := e.grantLease()
+	leaseID, err := e.register(info)
 	if err != nil {
-		return err
-	}
-
-	if err := e.register(info, leaseID); err != nil {
 		return err
 	}
 	meta := registerMeta{
 		leaseID: leaseID,
 	}
 	meta.ctx, meta.cancel = context.WithCancel(context.Background())
-	if err := e.keepalive(&meta); err != nil {
-		return err
-	}
 	e.meta = &meta
+	go e.keepalive(info, &meta)
+	//if err := e.keepalive(&meta); err != nil {
+	//	return err
+	//}
 	return nil
 }
 
@@ -120,10 +123,14 @@ func (e *etcdRegistry) Deregister(info *registry.Info) error {
 	return nil
 }
 
-func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) error {
+func (e *etcdRegistry) register(info *registry.Info) (clientv3.LeaseID, error) {
 	addr, err := e.getAddressOfRegistration(info)
 	if err != nil {
-		return err
+		return clientv3.NoLease, err
+	}
+	leaseID, err := e.grantLease()
+	if err != nil {
+		return clientv3.NoLease, err
 	}
 	val, err := json.Marshal(&instanceInfo{
 		Network: info.Addr.Network(),
@@ -132,12 +139,15 @@ func (e *etcdRegistry) register(info *registry.Info, leaseID clientv3.LeaseID) e
 		Tags:    info.Tags,
 	})
 	if err != nil {
-		return err
+		return clientv3.NoLease, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
 	defer cancel()
 	_, err = e.etcdClient.Put(ctx, serviceKey(info.ServiceName, addr), string(val), clientv3.WithLease(leaseID))
-	return err
+	if err != nil {
+		return clientv3.NoLease, err
+	}
+	return leaseID, nil
 }
 
 func (e *etcdRegistry) deregister(info *registry.Info) error {
@@ -161,24 +171,61 @@ func (e *etcdRegistry) grantLease() (clientv3.LeaseID, error) {
 	return resp.ID, nil
 }
 
-func (e *etcdRegistry) keepalive(meta *registerMeta) error {
-	keepAlive, err := e.etcdClient.KeepAlive(meta.ctx, meta.leaseID)
+func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
+	curLeaseID := meta.leaseID
+	lka, err := e.etcdClient.KeepAlive(meta.ctx, meta.leaseID)
 	if err != nil {
-		return err
+		curLeaseID = clientv3.NoLease
+	} else {
+		klog.Infof("start keepalive lease %x for etcd registry", curLeaseID)
 	}
-	go func() {
-		// eat keepAlive channel to keep related lease alive.
-		klog.Infof("start keepalive lease %x for etcd registry", meta.leaseID)
-		for range keepAlive {
-			select {
-			case <-meta.ctx.Done():
-				klog.Infof("stop keepalive lease %x for etcd registry", meta.leaseID)
+	rand.Seed(time.Now().Unix())
+	for {
+		// re-register
+		if curLeaseID == clientv3.NoLease {
+			var retreat []int
+			for retryCnt := 0; retryCnt < e.maxRetry; retryCnt++ {
+				retreat = append(retreat, 1<<retryCnt)
+				// check if context is done
+				if meta.ctx.Err() != nil {
+					return
+				}
+				id, registerErr := e.register(info)
+				// if register failed, retry
+				if registerErr != nil {
+					time.Sleep(time.Duration(retreat[rand.Intn(len(retreat))]) * time.Second)
+					continue
+				}
+				curLeaseID = id
+				lka, err = e.etcdClient.KeepAlive(meta.ctx, curLeaseID)
+				// if keepalive succeed, break
+				if err == nil {
+					break
+				}
+				// if re-register failed, wait for a while and retry
+				time.Sleep(time.Duration(retreat[rand.Intn(len(retreat))]) * time.Second)
+			}
+			if _, ok := <-lka; !ok {
+				// re-registration failed
 				return
-			default:
 			}
 		}
-	}()
-	return nil
+
+		select {
+		case _, ok := <-lka:
+			if !ok {
+				// check if context is done
+				if meta.ctx.Err() != nil {
+					return
+				}
+				// need to re-register
+				curLeaseID = clientv3.NoLease
+				continue
+			}
+		case <-meta.ctx.Done():
+			return
+		}
+	}
 }
 
 // getAddressOfRegistration returns the address of the service registration.
@@ -236,6 +283,16 @@ func getTTL() int64 {
 		}
 	}
 	return ttl
+}
+
+func getMaxRetry() int {
+	var maxRetry int = defaultMaxRetry
+	if str, ok := os.LookupEnv(maxRetryKey); ok {
+		if t, err := strconv.Atoi(str); err == nil {
+			maxRetry = t
+		}
+	}
+	return maxRetry
 }
 
 func getLocalIPv4Host() (string, error) {
