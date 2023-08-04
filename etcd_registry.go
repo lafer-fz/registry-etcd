@@ -105,9 +105,6 @@ func (e *etcdRegistry) Register(info *registry.Info) error {
 	meta.ctx, meta.cancel = context.WithCancel(context.Background())
 	e.meta = &meta
 	go e.keepalive(info, &meta)
-	//if err := e.keepalive(&meta); err != nil {
-	//	return err
-	//}
 	return nil
 }
 
@@ -175,6 +172,7 @@ func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
 	curLeaseID := meta.leaseID
 	lka, err := e.etcdClient.KeepAlive(meta.ctx, meta.leaseID)
 	if err != nil {
+		klog.Warnf("failed to keepalive lease %x for etcd registry: %v", curLeaseID, err)
 		curLeaseID = clientv3.NoLease
 	} else {
 		klog.Infof("start keepalive lease %x for etcd registry", curLeaseID)
@@ -188,11 +186,13 @@ func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
 				retreat = append(retreat, 1<<retryCnt)
 				// check if context is done
 				if meta.ctx.Err() != nil {
+					klog.Infof("context is done for etcd registry")
 					return
 				}
 				id, registerErr := e.register(info)
 				// if register failed, retry
 				if registerErr != nil {
+					klog.Infof("register failed for etcd registry: %v", registerErr)
 					time.Sleep(time.Duration(retreat[rand.Intn(len(retreat))]) * time.Second)
 					continue
 				}
@@ -202,11 +202,13 @@ func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
 				if err == nil {
 					break
 				}
+				klog.Warnf("failed to keepalive lease %x for etcd registry: %v", curLeaseID, err)
 				// if re-register failed, wait for a while and retry
 				time.Sleep(time.Duration(retreat[rand.Intn(len(retreat))]) * time.Second)
 			}
 			if _, ok := <-lka; !ok {
 				// re-registration failed
+				klog.Warnf("re-registration failed for etcd registry")
 				return
 			}
 		}
@@ -216,6 +218,7 @@ func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
 			if !ok {
 				// check if context is done
 				if meta.ctx.Err() != nil {
+					klog.Infof("context is done for etcd registry")
 					return
 				}
 				// need to re-register
@@ -223,6 +226,7 @@ func (e *etcdRegistry) keepalive(info *registry.Info, meta *registerMeta) {
 				continue
 			}
 		case <-meta.ctx.Done():
+			klog.Infof("stop keepalive lease %x for etcd registry", curLeaseID)
 			return
 		}
 	}
